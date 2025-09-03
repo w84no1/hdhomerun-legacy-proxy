@@ -19,12 +19,7 @@ This script runs as a background service. When it receives a request for a chann
 2.  **Set the Device ID:** When running the Docker container, you must set the `HDHOMERUN_ID` environment variable to your tuner's 8-character device ID.
 
 ## Usage (with Docker)
-1.  Place `proxy.py` and `Dockerfile` in a directory.
-2.  Build the Docker image:
-    ```sh
-    docker build -t hdhomerun-legacy-proxy .
-    ```
-3.  Run the container, making sure to use host networking and set your device ID:
+1.  Run the container, making sure to use host networking and set your device ID:
     ```sh
     docker run -d \
       --restart unless-stopped \
@@ -33,7 +28,7 @@ This script runs as a background service. When it receives a request for a chann
       --name hdhomerun-proxy \
       hdhomerun-legacy-proxy
     ```
-4.  In your PVR software (xTeVe, etc.), use the following URL for your M3U playlist, replacing `<YOUR_DOCKER_HOST_IP>` with the IP address of the machine running this container:
+2.  In your PVR software (xTeVe, etc.), use the following URL for your M3U playlist, replacing `<YOUR_DOCKER_HOST_IP>` with the IP address of the machine running this container:
     ```
     http://<YOUR_DOCKER_HOST_IP>:5004/lineup.m3u
     ```
