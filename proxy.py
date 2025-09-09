@@ -1,12 +1,12 @@
-# HDHomeRun Legacy UDP-to-HTTP Proxy (v7 - Multi-Threaded Server)
+# HDHomeRun Legacy UDP-to-HTTP Proxy (v7.1 - NameError Bugfix)
 import os
 import re
 import sys
 import json
 import subprocess
 import requests
-# New imports for the multi-threaded server
-from http.server import HTTPServer
+# Corrected imports for the multi-threaded server
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
 from urllib.parse import urlparse
 
@@ -24,7 +24,7 @@ class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
     pass
 
 def discover_hdhomerun():
-    # ... (This function is identical to v6.1) ...
+    # ... (This function is identical to v7) ...
     print("Discovering HDHomeRun device on the network...")
     try:
         discover_cmd = [HDHOMERUN_CONFIG_PATH, "discover"]
@@ -49,7 +49,7 @@ def discover_hdhomerun():
         return None
 
 def fetch_device_config_and_lineup(hdhr_ip):
-    # ... (This function is identical to v6.1) ...
+    # ... (This function is identical to v7) ...
     global TUNER_COUNT
     print("Attempting to fetch device config and channel lineup...")
     try:
@@ -83,7 +83,7 @@ def fetch_device_config_and_lineup(hdhr_ip):
         return None
 
 def find_free_tuner():
-    # ... (This function is identical to v6.1) ...
+    # ... (This function is identical to v7) ...
     for i in range(TUNER_COUNT):
         try:
             status_cmd = [HDHOMERUN_CONFIG_PATH, HDHOMERUN_IP, "get", f"/tuner{i}/status"]
@@ -97,7 +97,7 @@ def find_free_tuner():
     return None
 
 def run_command(command):
-    # ... (This function is identical to v6.1) ...
+    # ... (This function is identical to v7) ...
     try:
         subprocess.run(command, check=True, capture_output=True, text=True)
         return True
@@ -107,7 +107,7 @@ def run_command(command):
         return False
 
 def tune_to_channel(vchannel):
-    # ... (This function is identical to v6.1) ...
+    # ... (This function is identical to v7) ...
     tuner_index = find_free_tuner()
     if tuner_index is None:
         return None, False
@@ -129,7 +129,7 @@ def tune_to_channel(vchannel):
     return tuner_index, True
 
 class ProxyHTTPRequestHandler(BaseHTTPRequestHandler):
-    # ... (This class is identical to v6.1) ...
+    # ... (This class is identical to v7) ...
     def do_GET(self):
         parsed_path = urlparse(self.path)
         if parsed_path.path == '/lineup.m3u':
@@ -161,35 +161,4 @@ class ProxyHTTPRequestHandler(BaseHTTPRequestHandler):
             process = subprocess.Popen([HDHOMERUN_CONFIG_PATH, HDHOMERUN_IP, "save", f"/tuner{tuner_index}", "-"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             try:
                 while True:
-                    chunk = process.stdout.read(1024 * 128)
-                    if not chunk:
-                        break
-                    self.wfile.write(chunk)
-            except (BrokenPipeError, ConnectionResetError):
-                print(f"Client disconnected gracefully (Tuner {tuner_index}).")
-            finally:
-                process.terminate()
-                print(f"Stream stopped (Tuner {tuner_index}).")
-                run_command([HDHOMERUN_CONFIG_PATH, HDHOMERUN_IP, "set", f"/tuner{tuner_index}/channel", "none"])
-        else:
-            self.send_response(404)
-            self.end_headers()
-            self.wfile.write(b'Not Found.')
-
-if __name__ == '__main__':
-    HDHOMERUN_IP = discover_hdhomerun()
-    if HDHOMERUN_IP:
-        lineup = fetch_device_config_and_lineup(HDHOMERUN_IP)
-        if lineup:
-            CHANNELS = lineup
-            server_address = ('0.0.0.0', PROXY_PORT)
-            # Use the new ThreadingHTTPServer instead of the old HTTPServer
-            httpd = ThreadingHTTPServer(server_address, ProxyHTTPRequestHandler)
-            print(f"HDHomeRun Legacy Proxy (v7 - Multi-Threaded) started on http://0.0.0.0:{PROXY_PORT}")
-            httpd.serve_forever()
-        else:
-            print("FATAL ERROR: Could not fetch channel lineup. Exiting.")
-            sys.exit(1)
-    else:
-        print("FATAL ERROR: Could not discover HDHomeRun device. Exiting.")
-        sys.exit(1)
+                    chunk = process
