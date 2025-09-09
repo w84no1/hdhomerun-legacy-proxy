@@ -1,11 +1,12 @@
-# HDHomeRun Legacy UDP-to-HTTP Proxy (v7.1 - NameError Bugfix)
+# HDHomeRun Legacy UDP-to-HTTP Proxy (v8 - Keep-Alive Heartbeat)
 import os
 import re
 import sys
 import json
 import subprocess
 import requests
-# Corrected imports for the multi-threaded server
+import time
+import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
 from urllib.parse import urlparse
@@ -13,17 +14,34 @@ from urllib.parse import urlparse
 # --- CONFIGURATION ---
 HDHOMERUN_CONFIG_PATH = "hdhomerun_config"
 PROXY_PORT = 5004
+# Set the interval in seconds for the keep-alive ping
+KEEP_ALIVE_INTERVAL = 300  # 5 minutes
+# These will now be discovered automatically
 TUNER_COUNT = 0 
 CHANNELS = []
 HDHOMERUN_IP = None
 # ---------------------
 
-# New class definition for a multi-threaded server
 class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
     """Handle requests in a separate thread."""
     pass
 
+def keep_alive_thread():
+    """Periodically pings the HDHomeRun to keep the connection alive."""
+    print("Keep-alive thread started.")
+    while True:
+        time.sleep(KEEP_ALIVE_INTERVAL)
+        print("Keep-alive: Sending status ping to HDHomeRun...")
+        try:
+            # Use a lightweight command that doesn't require a tuner lock
+            status_cmd = [HDHOMERUN_CONFIG_PATH, HDHOMERUN_IP, "get", "/sys/version"]
+            subprocess.run(status_cmd, check=True, capture_output=True, text=True, timeout=10)
+            print("Keep-alive: Ping successful.")
+        except Exception as e:
+            print(f"Keep-alive: Ping failed. Will retry in {KEEP_ALIVE_INTERVAL} seconds. Error: {e}")
+
 def discover_hdhomerun():
+    # ... (This function is identical to v7.1) ...
     print("Discovering HDHomeRun device on the network...")
     try:
         discover_cmd = [HDHOMERUN_CONFIG_PATH, "discover"]
@@ -48,6 +66,7 @@ def discover_hdhomerun():
         return None
 
 def fetch_device_config_and_lineup(hdhr_ip):
+    # ... (This function is identical to v7.1) ...
     global TUNER_COUNT
     print("Attempting to fetch device config and channel lineup...")
     try:
@@ -81,6 +100,7 @@ def fetch_device_config_and_lineup(hdhr_ip):
         return None
 
 def find_free_tuner():
+    # ... (This function is identical to v7.1) ...
     for i in range(TUNER_COUNT):
         try:
             status_cmd = [HDHOMERUN_CONFIG_PATH, HDHOMERUN_IP, "get", f"/tuner{i}/status"]
@@ -94,6 +114,7 @@ def find_free_tuner():
     return None
 
 def run_command(command):
+    # ... (This function is identical to v7.1) ...
     try:
         subprocess.run(command, check=True, capture_output=True, text=True)
         return True
@@ -103,6 +124,7 @@ def run_command(command):
         return False
 
 def tune_to_channel(vchannel):
+    # ... (This function is identical to v7.1) ...
     tuner_index = find_free_tuner()
     if tuner_index is None:
         return None, False
@@ -124,6 +146,7 @@ def tune_to_channel(vchannel):
     return tuner_index, True
 
 class ProxyHTTPRequestHandler(BaseHTTPRequestHandler):
+    # ... (This class is identical to v7.1) ...
     def do_GET(self):
         parsed_path = urlparse(self.path)
         if parsed_path.path == '/lineup.m3u':
@@ -176,9 +199,15 @@ if __name__ == '__main__':
         lineup = fetch_device_config_and_lineup(HDHOMERUN_IP)
         if lineup:
             CHANNELS = lineup
+            
+            # Start the keep-alive thread in the background
+            heartbeat = threading.Thread(target=keep_alive_thread)
+            heartbeat.daemon = True  # Allows main program to exit even if thread is running
+            heartbeat.start()
+
             server_address = ('0.0.0.0', PROXY_PORT)
             httpd = ThreadingHTTPServer(server_address, ProxyHTTPRequestHandler)
-            print(f"HDHomeRun Legacy Proxy (v7.1 - Multi-Threaded) started on http://0.0.0.0:{PROXY_PORT}")
+            print(f"HDHomeRun Legacy Proxy (v8 - Heartbeat) started on http://0.0.0.0:{PROXY_PORT}")
             httpd.serve_forever()
         else:
             print("FATAL ERROR: Could not fetch channel lineup. Exiting.")
