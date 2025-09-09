@@ -1,30 +1,34 @@
-# HDHomeRun Legacy UDP-to-HTTP Proxy (v6 - Auto Discovery & Config)
+# HDHomeRun Legacy UDP-to-HTTP Proxy (v7 - Multi-Threaded Server)
 import os
 import re
 import sys
 import json
 import subprocess
 import requests
-from http.server import BaseHTTPRequestHandler, HTTPServer
+# New imports for the multi-threaded server
+from http.server import HTTPServer
+from socketserver import ThreadingMixIn
 from urllib.parse import urlparse
 
 # --- CONFIGURATION ---
 HDHOMERUN_CONFIG_PATH = "hdhomerun_config"
 PROXY_PORT = 5004
-# These will now be discovered automatically
 TUNER_COUNT = 0 
 CHANNELS = []
 HDHOMERUN_IP = None
 # ---------------------
 
+# New class definition for a multi-threaded server
+class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
+    """Handle requests in a separate thread."""
+    pass
+
 def discover_hdhomerun():
-    """Finds the first HDHomeRun on the network by calling the config tool."""
+    # ... (This function is identical to v6.1) ...
     print("Discovering HDHomeRun device on the network...")
     try:
         discover_cmd = [HDHOMERUN_CONFIG_PATH, "discover"]
         result = subprocess.run(discover_cmd, check=True, capture_output=True, text=True, timeout=10)
-        
-        # Output is typically "hdhomerun device 103DF11A found at 192.168.10.155"
         match = re.search(r'found at (\d+\.\d+\.\d+\.\d+)', result.stdout)
         if match:
             ip_address = match.group(1)
@@ -34,7 +38,6 @@ def discover_hdhomerun():
             print("Error: Discovery ran, but could not parse IP address from output:")
             print(result.stdout)
             return None
-            
     except FileNotFoundError:
         print(f"Error: '{HDHOMERUN_CONFIG_PATH}' command not found. Is it installed in the container?")
         return None
@@ -46,8 +49,8 @@ def discover_hdhomerun():
         return None
 
 def fetch_device_config_and_lineup(hdhr_ip):
-    """Connects to the HDHomeRun to get tuner count and the channel lineup."""
-    global TUNER_COUNT # Allow modification of the global variable
+    # ... (This function is identical to v6.1) ...
+    global TUNER_COUNT
     print("Attempting to fetch device config and channel lineup...")
     try:
         discover_url = f"http://{hdhr_ip}/discover.json"
@@ -55,8 +58,6 @@ def fetch_device_config_and_lineup(hdhr_ip):
         discover_resp = requests.get(discover_url, timeout=30)
         discover_resp.raise_for_status()
         discover_data = discover_resp.json()
-        
-        # Get Tuner Count
         tuner_count = discover_data.get('TunerCount')
         if tuner_count:
             TUNER_COUNT = int(tuner_count)
@@ -64,21 +65,16 @@ def fetch_device_config_and_lineup(hdhr_ip):
         else:
             print("Warning: Could not determine tuner count. Defaulting to 2.")
             TUNER_COUNT = 2
-
-        # Get Lineup URL
         lineup_url = discover_data.get('LineupURL')
         if not lineup_url:
             print("Error: LineupURL not found in discover.json")
             return None
-
         print(f"Fetching lineup URL: {lineup_url}")
         lineup_resp = requests.get(lineup_url, timeout=30)
         lineup_resp.raise_for_status()
         lineup_data = lineup_resp.json()
-        
         print(f"Successfully fetched {len(lineup_data)} channels.")
         return lineup_data
-
     except requests.exceptions.RequestException as e:
         print(f"Error: Network error fetching lineup: {e}")
         return None
@@ -87,7 +83,7 @@ def fetch_device_config_and_lineup(hdhr_ip):
         return None
 
 def find_free_tuner():
-    # ... (This function is identical to v5.1) ...
+    # ... (This function is identical to v6.1) ...
     for i in range(TUNER_COUNT):
         try:
             status_cmd = [HDHOMERUN_CONFIG_PATH, HDHOMERUN_IP, "get", f"/tuner{i}/status"]
@@ -101,7 +97,7 @@ def find_free_tuner():
     return None
 
 def run_command(command):
-    # ... (This function is identical to v5.1) ...
+    # ... (This function is identical to v6.1) ...
     try:
         subprocess.run(command, check=True, capture_output=True, text=True)
         return True
@@ -111,35 +107,29 @@ def run_command(command):
         return False
 
 def tune_to_channel(vchannel):
-    # ... (This function is identical to v5.1) ...
+    # ... (This function is identical to v6.1) ...
     tuner_index = find_free_tuner()
     if tuner_index is None:
         return None, False
-
     target_channel = next((c for c in CHANNELS if c['GuideNumber'] == vchannel), None)
     if not target_channel:
         print(f"Error: Virtual channel {vchannel} not found in channel list.")
         return None, False
-
     match = re.search(r'/ch(\d+)-(\d+)', target_channel['URL'])
     if not match:
         print(f"Error: Could not parse frequency/program from URL for channel {vchannel}: {target_channel['URL']}")
         return None, False
-        
     frequency, program = match.groups()
     print(f"Using tuner {tuner_index} to tune {HDHOMERUN_IP} to vchannel {vchannel} (Freq: {frequency}, Prog: {program})...")
-
     if not run_command([HDHOMERUN_CONFIG_PATH, HDHOMERUN_IP, "set", f"/tuner{tuner_index}/channel", f"8vsb:{frequency}"]):
         return None, False
-
     if not run_command([HDHOMERUN_CONFIG_PATH, HDHOMERUN_IP, "set", f"/tuner{tuner_index}/program", program]):
         return None, False
-
     print(f"Successfully tuned tuner {tuner_index} to vchannel {vchannel}.")
     return tuner_index, True
 
 class ProxyHTTPRequestHandler(BaseHTTPRequestHandler):
-    # ... (This class is identical to v5.1) ...
+    # ... (This class is identical to v6.1) ...
     def do_GET(self):
         parsed_path = urlparse(self.path)
         if parsed_path.path == '/lineup.m3u':
@@ -175,11 +165,11 @@ class ProxyHTTPRequestHandler(BaseHTTPRequestHandler):
                     if not chunk:
                         break
                     self.wfile.write(chunk)
-            except BrokenPipeError:
-                print("Client disconnected.")
+            except (BrokenPipeError, ConnectionResetError):
+                print(f"Client disconnected gracefully (Tuner {tuner_index}).")
             finally:
                 process.terminate()
-                print("Stream stopped.")
+                print(f"Stream stopped (Tuner {tuner_index}).")
                 run_command([HDHOMERUN_CONFIG_PATH, HDHOMERUN_IP, "set", f"/tuner{tuner_index}/channel", "none"])
         else:
             self.send_response(404)
@@ -193,8 +183,9 @@ if __name__ == '__main__':
         if lineup:
             CHANNELS = lineup
             server_address = ('0.0.0.0', PROXY_PORT)
-            httpd = HTTPServer(server_address, ProxyHTTPRequestHandler)
-            print(f"HDHomeRun Legacy Proxy (v6) started on http://0.0.0.0:{PROXY_PORT}")
+            # Use the new ThreadingHTTPServer instead of the old HTTPServer
+            httpd = ThreadingHTTPServer(server_address, ProxyHTTPRequestHandler)
+            print(f"HDHomeRun Legacy Proxy (v7 - Multi-Threaded) started on http://0.0.0.0:{PROXY_PORT}")
             httpd.serve_forever()
         else:
             print("FATAL ERROR: Could not fetch channel lineup. Exiting.")
