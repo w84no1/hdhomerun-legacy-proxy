@@ -14,7 +14,7 @@ RUN apt-get update && \
 # COPY proxy.py .
 
 # Expose the port the proxy will run on
-EXpose 5004
+EXPOSE port 5004
 
 # Command to run the proxy script when the container starts
 CMD ["python", "-u", "proxy.py"]
