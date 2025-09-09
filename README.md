@@ -1,37 +1,91 @@
-# HDHomeRun Legacy Docker Proxy
+# **HDHomeRun Legacy Docker Proxy**
 
-A simple Python proxy server, designed to run in Docker, that makes legacy SiliconDust HDHomeRun network tuners (which use a raw UDP/RTP stream) compatible with modern clients like xTeVe, Plex, and Jellyfin by rebroadcasting them as a standard HTTP stream.
+A self-contained, multi-threaded Docker service that makes legacy SiliconDust HDHomeRun network tuners compatible with modern PVR software like xTeVe, Plex, and Jellyfin.
 
-## The Problem
-Very old HDHomeRun models (e.g., HDHR-US, HDHR3-US) do not have the built-in HTTP server on port 5004 that modern clients expect. This makes them incompatible with most IPTV-style PVR software. The official HDHomeRun app still works, but third-party tools cannot access the streams.
+## **The Problem**
 
-## The Solution
-This script runs as a background service. When it receives a request for a channel, it uses the official `hdhomerun_config` command-line tool to tune the legacy device and then pipes the resulting raw video stream into a simple HTTP server. It also dynamically generates a `lineup.m3u` playlist for easy integration.
+Very old HDHomeRun models (e.g., the white box models like HDHR-US, HDHR3-US) do not have a built-in HTTP server for streaming. They serve raw MPEG-TS video data over UDP/RTP, a protocol that modern clients no longer support. This makes these perfectly functional legacy tuners incompatible with most modern PVR software.
 
-## Features
--   Acts as a bridge between legacy HDHomeRun tuners and modern clients.
--   Runs in a lightweight, self-contained Docker container.
--   Dynamically generates an M3U playlist compatible with xTeVe and other PVRs.
--   Configurable via environment variables and direct script edits.
+## **The Solution**
 
-## Configuration
-1.  **Edit the Channel Lineup:** Open the `proxy.py` file and edit the `CHANNELS` list to match the output from your tuner's API.
-2.  **Set the Device ID:** When running the Docker container, you must set the `HDHOMERUN_ID` environment variable to your tuner's 8-character device ID.
+This project runs a lightweight Python proxy in a Docker container. It acts as a smart bridge:
 
-## Usage (with Docker)
-1.  Run the container, making sure to use host networking and set your device ID:
-    ```sh
-    docker run -d \
-      --restart unless-stopped \
-      --net=host \
-      -e HDHOMERUN_ID=YOUR_ID_HERE \
-      --name hdhomerun-proxy \
-      hdhomerun-legacy-proxy
-    ```
-2.  In your PVR software (xTeVe, etc.), use the following URL for your M3U playlist, replacing `<YOUR_DOCKER_HOST_IP>` with the IP address of the machine running this container:
-    ```
-    http://<YOUR_DOCKER_HOST_IP>:5004/lineup.m3u
-    ```
+1. **Auto-Discovers:** It automatically finds your HDHomeRun tuner on the network.  
+2. **Auto-Configures:** It connects to the tuner, discovers its configuration (like tuner count), and automatically fetches the current channel lineup.  
+3. **Re-Broadcasts:** When a client requests a channel, the proxy uses the official `hdhomerun_config` command-line tool to tune a free tuner on the legacy device. It then captures the raw video stream and rebroadcasts it over a standard, modern HTTP stream that any client can understand.
 
-## Credits
-This script is a simplified and combined implementation based on the work of many community members who have developed solutions for these legacy tuners over the years.
+## **Features**
+
+* **Fully Automated:** No need to configure IP addresses, channel lists, or tuner counts. The service discovers everything on startup.  
+* **Multi-Client Ready:** The server is multi-threaded, allowing it to serve different channels to multiple clients simultaneously, up to the number of available tuners on your device.  
+* **Self-Contained:** The `proxy.py` script is baked into the Docker image, making deployment incredibly simple. No extra files are needed.  
+* **Lightweight:** The official Python-slim base image and minimal dependencies keep the container small and efficient.  
+* **Plug-and-Play:** Designed for easy deployment on any system that can run a Docker container.
+
+## **Prerequisites**
+
+* A legacy HDHomeRun network tuner on the same local network.  
+* A host machine (like a NAS, server, or Raspberry Pi) running Docker and Docker Compose (for the compose method).
+
+## **Deployment**
+
+There are two recommended methods for running this container. Using Docker Compose is the preferred method as it makes configuration clear and repeatable.
+
+### **Option 1: Using Docker Compose (Recommended)**
+
+1. Create a file named `docker-compose.yml` on your Docker host.  
+2. Paste the contents below into the file.  
+3. From your terminal in the same directory as the file, run the command `docker-compose up -d`.
+
+#### **`docker-compose.yml`**
+
+\# Docker Compose file for the HDHomeRun Legacy Proxy  
+version: '3.8'
+
+services:  
+  hdhomerun-proxy:  
+    \# This is the publicly available, self-contained image.  
+    \# Replace 'w84no1' with your Docker Hub username if you build your own.  
+    image: w84no1/hdhr-proxy:latest  
+      
+    container\_name: hdhomerun-proxy  
+      
+    \# CRITICAL: This allows the container to discover the HDHomeRun   
+    \# on your local network using UDP broadcasts.  
+    network\_mode: host  
+      
+    \# Ensures the container starts automatically if the server reboots.  
+    restart: unless-stopped
+
+### **Option 2: Using Docker Run**
+
+If you prefer not to use Docker Compose, you can run the container with a single command from your terminal.
+
+docker run \-d \\  
+  \--name hdhomerun-proxy \\  
+  \--net=host \\  
+  \--restart unless-stopped \\  
+  w84no1/hdhr-proxy:latest
+
+## **Using the Proxy**
+
+Once the container is running, it's ready to use.
+
+**M3U Playlist URL:** The proxy automatically generates a playlist compatible with most PVR software. Use the following URL in your client (xTeVe, Jellyfin, etc.), replacing `<YOUR_DOCKER_HOST_IP>` with the IP address of the machine running this container.  
+http://\<YOUR\_DOCKER\_HOST\_IP\>:5004/lineup.m3u
+
+* 
+
+## **Troubleshooting**
+
+* **Container Fails to Start with "No HDHomeRun devices found":**  
+  * Ensure your HDHomeRun is powered on and connected to the same network as your Docker host.  
+  * Confirm that `--net=host` (for `docker run`) or `network_mode: host` (for Docker Compose) is correctly set. This setting is essential for the discovery process to work.  
+* **Channels Won't Tune or Stream is Buffering:**  
+  * Check the container logs for errors using `docker logs hdhomerun-proxy`.  
+  * Ensure your Docker host has a stable network connection to the HDHomeRun.  
+  * Some host systems have a built-in firewall. Ensure it is not blocking traffic between the Docker container and your local network devices.
+
+## **Credits**
+
+This project relies on the official `hdhomerun-config` command-line utility provided by [SiliconDust](https://www.silicondust.com/).
