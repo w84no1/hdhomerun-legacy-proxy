@@ -10,8 +10,9 @@ RUN apt-get update && \
     pip install requests && \
     rm -rf /var/lib/apt/lists/*
 
-# The COPY command for proxy.py is not needed if using a volume mount
-# COPY proxy.py .
+# --- THIS LINE IS RE-ADDED ---
+# Copy the proxy script from the build folder into the container's /app directory
+COPY proxy.py .
 
 # Expose the port the proxy will run on
 EXPOSE 5004
