@@ -1,75 +1,115 @@
-# HDHomeRun Legacy UDP-to-HTTP Proxy with M3U Generator
+# HDHomeRun Legacy UDP-to-HTTP Proxy (v5 - Dynamic Lineup)
 import os
+import re
+import sys
+import json
 import subprocess
+import requests # New dependency
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import urlparse
 
 # --- CONFIGURATION ---
-# The path to your hdhomerun_config executable inside the container
 HDHOMERUN_CONFIG_PATH = "hdhomerun_config"
-# Port for this proxy server to run on
 PROXY_PORT = 5004
-# Your specific channel lineup (from your original API output)
-CHANNELS = [
-    {"GuideNumber": "7.1", "GuideName": "WDBJ", "URL": "hdhomerun://103DF11A/ch569000000-3"},
-    {"GuideNumber": "7.2", "GuideName": "WDBJ365", "URL": "hdhomerun://103DF11A/ch569000000-4"},
-    {"GuideNumber": "7.3", "GuideName": "HEROES", "URL": "hdhomerun://103DF11A/ch569000000-5"},
-    {"GuideNumber": "7.4", "GuideName": "CRIME", "URL": "hdhomerun://103DF11A/ch569000000-8"},
-    {"GuideNumber": "10.1", "GuideName": "WSLS-HD", "URL": "hdhomerun://103DF11A/ch593000000-3"},
-    {"GuideNumber": "10.2", "GuideName": "GetTV", "URL": "hdhomerun://103DF11A/ch593000000-4"},
-    {"GuideNumber": "10.3", "GuideName": "MeTV", "URL": "hdhomerun://103DF11A/ch593000000-5"},
-    {"GuideNumber": "10.4", "GuideName": "StartTV", "URL": "hdhomerun://103DF11A/ch593000000-6"},
-    {"GuideNumber": "10.5", "GuideName": "Movies", "URL": "hdhomerun://103DF11A/ch593000000-7"},
-    {"GuideNumber": "13.1", "GuideName": "ABC", "URL": "hdhomerun://103DF11A/ch177000000-3"},
-    {"GuideNumber": "13.2", "GuideName": "Charge!", "URL": "hdhomerun://103DF11A/ch177000000-4"},
-    {"GuideNumber": "13.3", "GuideName": "Comet", "URL": "hdhomerun://103DF11A/ch177000000-5"},
-    {"GuideNumber": "13.4", "GuideName": "ROAR", "URL": "hdhomerun://103DF11A/ch177000000-6"},
-    {"GuideNumber": "21.1", "GuideName": "WWCW-HD", "URL": "hdhomerun://103DF11A/ch515000000-3"},
-    {"GuideNumber": "21.2", "GuideName": "WFXR-HD", "URL": "hdhomerun://103DF11A/ch515000000-4"},
-    {"GuideNumber": "21.3", "GuideName": "Rewind", "URL": "hdhomerun://103DF11A/ch515000000-5"},
-    {"GuideNumber": "21.4", "GuideName": "Grit", "URL": "hdhomerun://103DF11A/ch515000000-6"},
-    {"GuideNumber": "24.1", "GuideName": "WZBJ24", "URL": "hdhomerun://103DF11A/ch177000000-7"},
-    {"GuideNumber": "24.2", "GuideName": "Cozi", "URL": "hdhomerun://103DF11A/ch515000000-7"},
-    {"GuideNumber": "24.3", "GuideName": "Decades", "URL": "hdhomerun://103DF11A/ch515000000-8"},
-    {"GuideNumber": "24.4", "GuideName": "DABL", "URL": "hdhomerun://103DF11A/ch569000000-6"},
-    {"GuideNumber": "27.1", "GuideName": "WFXR-HD", "URL": "hdhomerun://103DF11A/ch605000000-3"},
-    {"GuideNumber": "27.2", "GuideName": "WWCW-HD", "URL": "hdhomerun://103DF11A/ch605000000-4"},
-    {"GuideNumber": "27.3", "GuideName": "Bounce", "URL": "hdhomerun://103DF11A/ch605000000-5"},
-    {"GuideNumber": "27.4", "GuideName": "ANT TV", "URL": "hdhomerun://103DF11A/ch605000000-6"},
-    {"GuideNumber": "38.1", "GuideName": "ION", "URL": "hdhomerun://103DF11A/ch551000000-3"},
-    {"GuideNumber": "38.2", "GuideName": "CourtTV", "URL": "hdhomerun://103DF11A/ch551000000-4"},
-    {"GuideNumber": "38.3", "GuideName": "Laff", "URL": "hdhomerun://103DF11A/ch551000000-5"},
-    {"GuideNumber": "38.4", "GuideName": "Mystery", "URL": "hdhomerun://103DF11A/ch551000000-6"},
-    {"GuideNumber": "38.5", "GuideName": "IONPlus", "URL": "hdhomerun://103DF11A/ch551000000-7"},
-    {"GuideNumber": "38.6", "GuideName": "BUSTED", "URL": "hdhomerun://103DF11A/ch551000000-8"},
-    {"GuideNumber": "38.7", "GuideName": "GameSho", "URL": "hdhomerun://103DF11A/ch551000000-9"},
-    {"GuideNumber": "38.8", "GuideName": "HSN", "URL": "hdhomerun://103DF11A/ch551000000-10"},
-    {"GuideNumber": "38.9", "GuideName": "QVC", "URL": "hdhomerun://103DF11A/ch551000000-11"}
-]
+TUNER_COUNT = 2 
+# The hardcoded CHANNELS list has been removed!
+CHANNELS = []
 # ---------------------
 
-# Read Device ID from environment variable, with a fallback
-HDHOMERUN_ID = os.getenv('HDHOMERUN_ID', '103DF11A')
+HDHOMERUN_IP = os.getenv('HDHOMERUN_IP')
 
-def tune_to_vchannel(channel):
-    print(f"Tuning to virtual channel {channel}...")
+def fetch_channel_lineup(hdhr_ip):
+    """Connects to the HDHomeRun to discover and fetch the channel lineup."""
+    print("Attempting to fetch channel lineup...")
     try:
-        subprocess.run([HDHOMERUN_CONFIG_PATH, HDHOMERUN_ID, "set", "/tuner0/vchannel", channel], check=True, capture_output=True)
-        print(f"Successfully tuned to vchannel {channel}.")
+        # Step 1: Discover the lineup URL
+        discover_url = f"http://{hdhr_ip}/discover.json"
+        print(f"Fetching discover URL: {discover_url}")
+        discover_resp = requests.get(discover_url, timeout=5)
+        discover_resp.raise_for_status()
+        discover_data = discover_resp.json()
+        lineup_url = discover_data.get('LineupURL')
+
+        if not lineup_url:
+            print("Error: LineupURL not found in discover.json")
+            return None
+
+        # Step 2: Fetch the actual lineup from the URL
+        print(f"Fetching lineup URL: {lineup_url}")
+        lineup_resp = requests.get(lineup_url, timeout=5)
+        lineup_resp.raise_for_status()
+        lineup_data = lineup_resp.json()
+        
+        print(f"Successfully fetched {len(lineup_data)} channels.")
+        return lineup_data
+
+    except requests.exceptions.RequestException as e:
+        print(f"Error: Network error fetching lineup: {e}")
+        return None
+    except json.JSONDecodeError as e:
+        print(f"Error: Could not parse JSON response: {e}")
+        return None
+
+def find_free_tuner():
+    # ... (This function is identical to v4) ...
+    for i in range(TUNER_COUNT):
+        try:
+            status_cmd = [HDHOMERUN_CONFIG_PATH, HDHOMERUN_IP, "get", f"/tuner{i}/status"]
+            result = subprocess.run(status_cmd, check=True, capture_output=True, text=True)
+            if "ch=none" in result.stdout:
+                print(f"Found free tuner: {i}")
+                return i
+        except subprocess.CalledProcessError:
+            continue
+    print("Error: No free tuners available.")
+    return None
+
+def run_command(command):
+    # ... (This function is identical to v4) ...
+    try:
+        subprocess.run(command, check=True, capture_output=True, text=True)
         return True
     except subprocess.CalledProcessError as e:
-        print(f"Error tuning to vchannel {channel}: {e.stderr.decode().strip()}")
+        error_output = e.stderr.strip() if e.stderr else "No error output from command."
+        print(f"Command failed: {' '.join(command)}\nError: {error_output}")
         return False
 
+def tune_to_channel(vchannel):
+    # ... (This function is identical to v4) ...
+    tuner_index = find_free_tuner()
+    if tuner_index is None:
+        return None, False
+
+    target_channel = next((c for c in CHANNELS if c['GuideNumber'] == vchannel), None)
+    if not target_channel:
+        print(f"Error: Virtual channel {vchannel} not found in channel list.")
+        return None, False
+
+    match = re.search(r'/ch(\d+)-(\d+)', target_channel['URL'])
+    if not match:
+        print(f"Error: Could not parse frequency/program from URL for channel {vchannel}: {target_channel['URL']}")
+        return None, False
+        
+    frequency, program = match.groups()
+    print(f"Using tuner {tuner_index} to tune {HDHOMERUN_IP} to vchannel {vchannel} (Freq: {frequency}, Prog: {program})...")
+
+    if not run_command([HDHOMERUN_CONFIG_PATH, HDHOMERUN_IP, "set", f"/tuner{tuner_index}/channel", f"8vsb:{frequency}"]):
+        return None, False
+
+    if not run_command([HDHOMERUN_CONFIG_PATH, HDHOMERUN_IP, "set", f"/tuner{tuner_index}/program", program]):
+        return None, False
+
+    print(f"Successfully tuned tuner {tuner_index} to vchannel {vchannel}.")
+    return tuner_index, True
+
 class ProxyHTTPRequestHandler(BaseHTTPRequestHandler):
+    # ... (This class is identical to v4) ...
     def do_GET(self):
         parsed_path = urlparse(self.path)
-
         if parsed_path.path == '/lineup.m3u':
             self.send_response(200)
             self.send_header('Content-Type', 'application/x-mpegURL')
             self.end_headers()
-            
             host = self.headers['Host']
             m3u_content = "#EXTM3U\n"
             for chan in CHANNELS:
@@ -79,22 +119,29 @@ class ProxyHTTPRequestHandler(BaseHTTPRequestHandler):
             return
 
         if parsed_path.path.startswith('/auto/v'):
-            channel = parsed_path.path.split('v')[-1]
-            if not tune_to_vchannel(channel):
+            if not HDHOMERUN_IP:
                 self.send_response(500)
                 self.end_headers()
-                self.wfile.write(b'Failed to tune HDHomeRun.')
+                self.wfile.write(b'HDHOMERUN_IP environment variable not set on server.')
+                return
+
+            channel = parsed_path.path.split('v')[-1]
+            tuner_index, success = tune_to_channel(channel)
+            if not success:
+                self.send_response(500)
+                self.end_headers()
+                self.wfile.write(b'Failed to find or tune a free tuner.')
                 return
 
             self.send_response(200)
             self.send_header('Content-Type', 'video/mpeg')
             self.end_headers()
 
-            print(f"Starting stream for vchannel {channel}...")
-            process = subprocess.Popen([HDHOMERUN_CONFIG_PATH, HDHOMERUN_ID, "save", "/tuner0", "-"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            print(f"Starting stream from tuner {tuner_index} for vchannel {channel}...")
+            process = subprocess.Popen([HDHOMERUN_CONFIG_PATH, HDHOMERUN_IP, "save", f"/tuner{tuner_index}", "-"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             try:
                 while True:
-                    chunk = process.stdout.read(1024 * 128) # Increased buffer size
+                    chunk = process.stdout.read(1024 * 128)
                     if not chunk:
                         break
                     self.wfile.write(chunk)
@@ -103,13 +150,27 @@ class ProxyHTTPRequestHandler(BaseHTTPRequestHandler):
             finally:
                 process.terminate()
                 print("Stream stopped.")
+                run_command([HDHOMERUN_CONFIG_PATH, HDHOMERUN_IP, "set", f"/tuner{tuner_index}/channel", "none"])
+
         else:
             self.send_response(404)
             self.end_headers()
             self.wfile.write(b'Not Found.')
 
 if __name__ == '__main__':
-    server_address = ('0.0.0.0', PROXY_PORT)
-    httpd = HTTPServer(server_address, ProxyHTTPRequestHandler)
-    print(f"HDHomeRun Legacy Proxy started on http://0.0.0.0:{PROXY_PORT}")
-    httpd.serve_forever()
+    if not HDHOMERUN_IP:
+        print("FATAL ERROR: HDHOMERUN_IP environment variable is not set. Exiting.")
+        sys.exit(1)
+    
+    # Fetch the lineup before starting the server
+    lineup = fetch_channel_lineup(HDHOMERUN_IP)
+    if lineup:
+        CHANNELS = lineup
+        server_address = ('0.0.0.0', PROXY_PORT)
+        httpd = HTTPServer(server_address, ProxyHTTPRequestHandler)
+        print(f"HDHomeRun Legacy Proxy (v5) started on http://0.0.0.0:{PROXY_PORT}")
+        print(f"Targeting HDHomeRun at IP: {HDHOMERUN_IP}")
+        httpd.serve_forever()
+    else:
+        print("FATAL ERROR: Could not fetch channel lineup. Exiting.")
+        sys.exit(1)
