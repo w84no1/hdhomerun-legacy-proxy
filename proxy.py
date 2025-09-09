@@ -1,10 +1,10 @@
-# HDHomeRun Legacy UDP-to-HTTP Proxy (v5 - Dynamic Lineup)
+# HDHomeRun Legacy UDP-to-HTTP Proxy (v5.1 - Increased Timeout)
 import os
 import re
 import sys
 import json
 import subprocess
-import requests # New dependency
+import requests 
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import urlparse
 
@@ -12,7 +12,6 @@ from urllib.parse import urlparse
 HDHOMERUN_CONFIG_PATH = "hdhomerun_config"
 PROXY_PORT = 5004
 TUNER_COUNT = 2 
-# The hardcoded CHANNELS list has been removed!
 CHANNELS = []
 # ---------------------
 
@@ -25,7 +24,8 @@ def fetch_channel_lineup(hdhr_ip):
         # Step 1: Discover the lineup URL
         discover_url = f"http://{hdhr_ip}/discover.json"
         print(f"Fetching discover URL: {discover_url}")
-        discover_resp = requests.get(discover_url, timeout=5)
+        # Increased timeout from 5 to 30 seconds
+        discover_resp = requests.get(discover_url, timeout=30) 
         discover_resp.raise_for_status()
         discover_data = discover_resp.json()
         lineup_url = discover_data.get('LineupURL')
@@ -36,7 +36,8 @@ def fetch_channel_lineup(hdhr_ip):
 
         # Step 2: Fetch the actual lineup from the URL
         print(f"Fetching lineup URL: {lineup_url}")
-        lineup_resp = requests.get(lineup_url, timeout=5)
+        # Increased timeout from 5 to 30 seconds
+        lineup_resp = requests.get(lineup_url, timeout=30) 
         lineup_resp.raise_for_status()
         lineup_data = lineup_resp.json()
         
@@ -50,8 +51,9 @@ def fetch_channel_lineup(hdhr_ip):
         print(f"Error: Could not parse JSON response: {e}")
         return None
 
+# --- The rest of the script is identical to the previous version ---
+
 def find_free_tuner():
-    # ... (This function is identical to v4) ...
     for i in range(TUNER_COUNT):
         try:
             status_cmd = [HDHOMERUN_CONFIG_PATH, HDHOMERUN_IP, "get", f"/tuner{i}/status"]
@@ -65,7 +67,6 @@ def find_free_tuner():
     return None
 
 def run_command(command):
-    # ... (This function is identical to v4) ...
     try:
         subprocess.run(command, check=True, capture_output=True, text=True)
         return True
@@ -75,7 +76,6 @@ def run_command(command):
         return False
 
 def tune_to_channel(vchannel):
-    # ... (This function is identical to v4) ...
     tuner_index = find_free_tuner()
     if tuner_index is None:
         return None, False
@@ -103,7 +103,6 @@ def tune_to_channel(vchannel):
     return tuner_index, True
 
 class ProxyHTTPRequestHandler(BaseHTTPRequestHandler):
-    # ... (This class is identical to v4) ...
     def do_GET(self):
         parsed_path = urlparse(self.path)
         if parsed_path.path == '/lineup.m3u':
@@ -151,7 +150,6 @@ class ProxyHTTPRequestHandler(BaseHTTPRequestHandler):
                 process.terminate()
                 print("Stream stopped.")
                 run_command([HDHOMERUN_CONFIG_PATH, HDHOMERUN_IP, "set", f"/tuner{tuner_index}/channel", "none"])
-
         else:
             self.send_response(404)
             self.end_headers()
@@ -162,13 +160,12 @@ if __name__ == '__main__':
         print("FATAL ERROR: HDHOMERUN_IP environment variable is not set. Exiting.")
         sys.exit(1)
     
-    # Fetch the lineup before starting the server
     lineup = fetch_channel_lineup(HDHOMERUN_IP)
     if lineup:
         CHANNELS = lineup
         server_address = ('0.0.0.0', PROXY_PORT)
         httpd = HTTPServer(server_address, ProxyHTTPRequestHandler)
-        print(f"HDHomeRun Legacy Proxy (v5) started on http://0.0.0.0:{PROXY_PORT}")
+        print(f"HDHomeRun Legacy Proxy (v5.1) started on http://0.0.0.0:{PROXY_PORT}")
         print(f"Targeting HDHomeRun at IP: {HDHOMERUN_IP}")
         httpd.serve_forever()
     else:
