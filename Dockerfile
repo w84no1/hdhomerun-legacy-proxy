@@ -6,16 +6,19 @@ WORKDIR /app
 
 # Install dependencies: hdhomerun_config and the Python 'requests' library
 RUN apt-get update && \
-    apt-get install -y hdhomerun-config && \
+    apt-get install -y hdhomerun-config curl && \
     pip install requests && \
     rm -rf /var/lib/apt/lists/*
 
-# --- THIS LINE IS RE-ADDED ---
-# Copy the proxy script from the build folder into the container's /app directory
+# Copy the proxy script into the container
 COPY proxy.py .
 
 # Expose the port the proxy will run on
 EXPOSE 5004
+
+# Health check using the new /health endpoint
+HEALTHCHECK --interval=60s --timeout=5s --start-period=30s --retries=3 \
+    CMD curl -f http://localhost:5004/health || exit 1
 
 # Command to run the proxy script when the container starts
 CMD ["python", "-u", "proxy.py"]
