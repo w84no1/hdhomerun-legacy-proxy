@@ -1,16 +1,18 @@
-# HDHomeRun Legacy UDP-to-HTTP Proxy (v9 - Active Wake & Recovery)
+# HDHomeRun Legacy UDP-to-HTTP Proxy (v10 — Refactored)
 import os
 import re
+import select
 import sys
 import json
 import signal
 import subprocess
-import requests
 import time
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
 from urllib.parse import urlparse
+from urllib.request import urlopen
+from urllib.error import URLError
 
 # --- CONFIGURATION (Environment Variable Overrides) ---
 HDHOMERUN_CONFIG_PATH = os.environ.get("HDHOMERUN_CONFIG_PATH", "hdhomerun_config")
@@ -18,14 +20,122 @@ PROXY_PORT = int(os.environ.get("PROXY_PORT", "5004"))
 KEEP_ALIVE_INTERVAL = int(os.environ.get("KEEP_ALIVE_INTERVAL", "60"))  # seconds
 WAKE_MAX_RETRIES = int(os.environ.get("WAKE_MAX_RETRIES", "3"))
 STREAM_CHUNK_SIZE = int(os.environ.get("STREAM_CHUNK_SIZE", str(1024 * 128)))  # 128KB
+STREAM_READ_TIMEOUT = int(os.environ.get("STREAM_READ_TIMEOUT", "30"))  # seconds
+MODULATION = os.environ.get("MODULATION", "8vsb")  # 8vsb (ATSC OTA), qam256 (ClearQAM)
 
-# --- STATE (mutable globals protected by lock) ---
-_state_lock = threading.Lock()
-TUNER_COUNT = 0
-CHANNELS = []
-HDHOMERUN_IP = os.environ.get("HDHOMERUN_IP", None)  # Optional: skip auto-discovery
-# --------------------------------------------------
 
+# =============================================================================
+#  Thread-safe Device State
+# =============================================================================
+
+class DeviceState:
+    """Thread-safe container for all mutable HDHomeRun device state.
+
+    Replaces the scattered global variables with property accessors that
+    always hold the internal lock.  Per-tuner allocation locks prevent the
+    TOCTOU race in find-free-tuner → tune.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._ip = os.environ.get("HDHOMERUN_IP")
+        self._tuner_count = 0
+        self._channels = []
+        self._tuner_locks = []  # one Lock per tuner slot
+
+    # -- IP -------------------------------------------------------------------
+
+    @property
+    def ip(self):
+        with self._lock:
+            return self._ip
+
+    @ip.setter
+    def ip(self, value):
+        with self._lock:
+            self._ip = value
+
+    # -- Tuner count ----------------------------------------------------------
+
+    @property
+    def tuner_count(self):
+        with self._lock:
+            return self._tuner_count
+
+    @tuner_count.setter
+    def tuner_count(self, value):
+        with self._lock:
+            if self._tuner_count != value:
+                self._tuner_count = value
+                self._tuner_locks = [threading.Lock() for _ in range(value)]
+            else:
+                self._tuner_count = value
+
+    # -- Channels -------------------------------------------------------------
+
+    @property
+    def channels(self):
+        """Return a shallow copy so callers can iterate without holding the lock."""
+        with self._lock:
+            return list(self._channels)
+
+    @channels.setter
+    def channels(self, value):
+        with self._lock:
+            self._channels = list(value)
+
+    @property
+    def channel_count(self):
+        """Number of channels without copying the list."""
+        with self._lock:
+            return len(self._channels)
+
+    # -- Tuner allocation (per-tuner lock) ------------------------------------
+
+    def acquire_tuner(self):
+        """Try to acquire a free tuner.  Returns the tuner index, or None.
+
+        The caller **must** call ``release_tuner()`` when done streaming.
+        """
+        count = self.tuner_count
+        ip = self.ip
+        for i in range(count):
+            if self._tuner_locks[i].acquire(blocking=False):
+                # We hold the slot lock — verify the device agrees it's free.
+                try:
+                    result = subprocess.run(
+                        [HDHOMERUN_CONFIG_PATH, ip, "get", f"/tuner{i}/status"],
+                        check=True, capture_output=True, text=True, timeout=5,
+                    )
+                    if "ch=none" in result.stdout:
+                        print(f"  Acquired tuner {i}")
+                        return i
+                    print(f"  Tuner {i} in use externally, skipping.")
+                except Exception:
+                    pass
+                self._tuner_locks[i].release()
+
+        print("  No free tuners available.")
+        return None
+
+    def release_tuner(self, index):
+        """Release a previously acquired tuner slot."""
+        try:
+            self._tuner_locks[index].release()
+        except (RuntimeError, IndexError):
+            pass  # already released or index out of range
+
+
+# Singleton state
+device = DeviceState()
+
+# Shutdown coordination
+_shutdown_event = threading.Event()
+
+
+# =============================================================================
+#  Threading HTTP Server
+# =============================================================================
 
 class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
     """Handle requests in a separate thread."""
@@ -40,18 +150,17 @@ def discover_hdhomerun():
     """Broadcast-discover an HDHomeRun on the local network (UDP port 65001)."""
     print("Discovering HDHomeRun device on the network...")
     try:
-        discover_cmd = [HDHOMERUN_CONFIG_PATH, "discover"]
         result = subprocess.run(
-            discover_cmd, check=True, capture_output=True, text=True, timeout=10
+            [HDHOMERUN_CONFIG_PATH, "discover"],
+            check=True, capture_output=True, text=True, timeout=10,
         )
         match = re.search(r'found at (\d+\.\d+\.\d+\.\d+)', result.stdout)
         if match:
-            ip_address = match.group(1)
-            print(f"Found HDHomeRun at IP: {ip_address}")
-            return ip_address
-        else:
-            print(f"Discovery ran but could not parse IP from output: {result.stdout.strip()}")
-            return None
+            ip = match.group(1)
+            print(f"Found HDHomeRun at IP: {ip}")
+            return ip
+        print(f"Discovery ran but could not parse IP: {result.stdout.strip()}")
+        return None
     except FileNotFoundError:
         print(f"FATAL: '{HDHOMERUN_CONFIG_PATH}' not found. Is it installed?")
         return None
@@ -65,34 +174,32 @@ def discover_hdhomerun():
 
 def device_is_reachable(ip, timeout=5):
     """Quick check: can we talk to the HDHR at the given IP?"""
+    if not ip:
+        return False
     try:
-        cmd = [HDHOMERUN_CONFIG_PATH, ip, "get", "/sys/version"]
-        result = subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=timeout)
+        result = subprocess.run(
+            [HDHOMERUN_CONFIG_PATH, ip, "get", "/sys/version"],
+            check=True, capture_output=True, text=True, timeout=timeout,
+        )
         return bool(result.stdout.strip())
     except Exception:
         return False
 
 
 def wake_and_recover():
-    """
-    Attempt to wake / rediscover the HDHomeRun.
-    Uses exponential backoff across retries.  On success the global IP and
-    CHANNELS are updated.
+    """Attempt to wake / rediscover the HDHomeRun with exponential backoff.
+
+    On success the global IP and channel lineup are updated.
     Returns True if the device is reachable after recovery.
     """
-    global HDHOMERUN_IP, CHANNELS, TUNER_COUNT
-
     for attempt in range(1, WAKE_MAX_RETRIES + 1):
-        print(f"Wake attempt {attempt}/{WAKE_MAX_RETRIES}: running full UDP discovery...")
+        print(f"Wake attempt {attempt}/{WAKE_MAX_RETRIES}: running UDP discovery...")
         new_ip = discover_hdhomerun()
         if new_ip and device_is_reachable(new_ip):
-            with _state_lock:
-                HDHOMERUN_IP = new_ip
-            # Refresh lineup in case anything changed
+            device.ip = new_ip
             lineup = fetch_device_config_and_lineup(new_ip)
             if lineup:
-                with _state_lock:
-                    CHANNELS = lineup
+                device.channels = lineup
             print(f"Wake successful — device at {new_ip}")
             return True
         backoff = 2 ** (attempt - 1)
@@ -108,23 +215,24 @@ def wake_and_recover():
 # =============================================================================
 
 def fetch_device_config_and_lineup(hdhr_ip):
-    """Fetch tuner count and channel lineup from the HDHR's HTTP interface."""
-    global TUNER_COUNT
+    """Fetch tuner count and channel lineup from the HDHR's HTTP interface.
+
+    Uses stdlib ``urllib`` — no external dependencies required.
+    """
     print("Fetching device config and channel lineup...")
     try:
         discover_url = f"http://{hdhr_ip}/discover.json"
         print(f"  GET {discover_url}")
-        discover_resp = requests.get(discover_url, timeout=30)
-        discover_resp.raise_for_status()
-        discover_data = discover_resp.json()
+        with urlopen(discover_url, timeout=30) as resp:
+            discover_data = json.loads(resp.read().decode("utf-8"))
 
         tuner_count = discover_data.get("TunerCount")
         if tuner_count:
-            TUNER_COUNT = int(tuner_count)
-            print(f"  Device reports {TUNER_COUNT} tuner(s).")
+            device.tuner_count = int(tuner_count)
+            print(f"  Device reports {device.tuner_count} tuner(s).")
         else:
             print("  Warning: TunerCount missing — defaulting to 2.")
-            TUNER_COUNT = 2
+            device.tuner_count = 2
 
         lineup_url = discover_data.get("LineupURL")
         if not lineup_url:
@@ -132,13 +240,12 @@ def fetch_device_config_and_lineup(hdhr_ip):
             return None
 
         print(f"  GET {lineup_url}")
-        lineup_resp = requests.get(lineup_url, timeout=30)
-        lineup_resp.raise_for_status()
-        lineup_data = lineup_resp.json()
+        with urlopen(lineup_url, timeout=30) as resp:
+            lineup_data = json.loads(resp.read().decode("utf-8"))
         print(f"  Fetched {len(lineup_data)} channel(s).")
         return lineup_data
 
-    except requests.exceptions.RequestException as e:
+    except (URLError, OSError) as e:
         print(f"  Network error fetching lineup: {e}")
         return None
     except (json.JSONDecodeError, KeyError) as e:
@@ -150,39 +257,8 @@ def fetch_device_config_and_lineup(hdhr_ip):
 #  Tuner Helpers
 # =============================================================================
 
-def cleanup_tuners():
-    """Release all tuners — called on startup and shutdown to clear stale locks."""
-    if TUNER_COUNT == 0:
-        return
-    print("Releasing all tuners...")
-    for i in range(TUNER_COUNT):
-        try:
-            run_command([HDHOMERUN_CONFIG_PATH, HDHOMERUN_IP, "set",
-                         f"/tuner{i}/channel", "none"])
-        except Exception:
-            pass
-    print("All tuners released.")
-
-
-def find_free_tuner():
-    """Return the index of a free tuner, or None."""
-    for i in range(TUNER_COUNT):
-        try:
-            status_cmd = [HDHOMERUN_CONFIG_PATH, HDHOMERUN_IP, "get", f"/tuner{i}/status"]
-            result = subprocess.run(
-                status_cmd, check=True, capture_output=True, text=True, timeout=5
-            )
-            if "ch=none" in result.stdout:
-                print(f"  Found free tuner: {i}")
-                return i
-        except subprocess.CalledProcessError:
-            continue
-    print("  Error: No free tuners available.")
-    return None
-
-
 def run_command(command, timeout=10):
-    """Run a subprocess command. Returns True on success, False on failure."""
+    """Run a subprocess command.  Returns True on success, False on failure."""
     try:
         subprocess.run(command, check=True, capture_output=True, text=True, timeout=timeout)
         return True
@@ -195,43 +271,69 @@ def run_command(command, timeout=10):
         return False
 
 
+def cleanup_tuners():
+    """Release all tuners — called on startup and shutdown to clear stale locks."""
+    ip = device.ip
+    count = device.tuner_count
+    if not ip or count == 0:
+        return
+    print("Releasing all tuners...")
+    for i in range(count):
+        try:
+            run_command([HDHOMERUN_CONFIG_PATH, ip, "set",
+                         f"/tuner{i}/channel", "none"])
+        except Exception:
+            pass
+    print("All tuners released.")
+
+
 def tune_to_channel(vchannel):
-    """
-    Find a free tuner and tune it to the given virtual channel.
+    """Acquire a free tuner and tune it to the given virtual channel.
+
     If the device is unreachable, attempts a wake/recovery cycle first.
-    Returns (tuner_index, success).
+    Returns ``(tuner_index, success)``.  On success the caller **must**
+    call ``device.release_tuner(tuner_index)`` and reset the tuner channel
+    when done streaming.
     """
+    current_ip = device.ip
+
     # Pre-flight: is the device reachable?
-    if not device_is_reachable(HDHOMERUN_IP):
-        print(f"Device {HDHOMERUN_IP} unreachable — attempting wake...")
+    if not device_is_reachable(current_ip):
+        print(f"Device {current_ip} unreachable — attempting wake...")
         if not wake_and_recover():
             return None, False
+        current_ip = device.ip  # may have changed after recovery
 
-    tuner_index = find_free_tuner()
+    tuner_index = device.acquire_tuner()
     if tuner_index is None:
         return None, False
 
-    with _state_lock:
-        channels = list(CHANNELS)
+    channels = device.channels
 
     target_channel = next((c for c in channels if c["GuideNumber"] == vchannel), None)
     if not target_channel:
         print(f"  Error: Virtual channel {vchannel} not in channel list.")
+        device.release_tuner(tuner_index)
         return None, False
 
-    match = re.search(r'/ch(\d+)-(\d+)', target_channel["URL"])
+    url = target_channel.get("URL", "")
+    match = re.search(r'/ch(\d+)-(\d+)', url)
     if not match:
-        print(f"  Error: Cannot parse freq/program from URL: {target_channel['URL']}")
+        print(f"  Error: Cannot parse freq/program from URL: {url}")
+        device.release_tuner(tuner_index)
         return None, False
 
     frequency, program = match.groups()
-    print(f"  Tuning tuner {tuner_index} → vchannel {vchannel} (Freq:{frequency} Prog:{program})...")
+    print(f"  Tuning tuner {tuner_index} → vchannel {vchannel} "
+          f"(Freq:{frequency} Prog:{program} Mod:{MODULATION})...")
 
-    if not run_command([HDHOMERUN_CONFIG_PATH, HDHOMERUN_IP, "set",
-                        f"/tuner{tuner_index}/channel", f"8vsb:{frequency}"]):
+    if not run_command([HDHOMERUN_CONFIG_PATH, current_ip, "set",
+                        f"/tuner{tuner_index}/channel", f"{MODULATION}:{frequency}"]):
+        device.release_tuner(tuner_index)
         return None, False
-    if not run_command([HDHOMERUN_CONFIG_PATH, HDHOMERUN_IP, "set",
+    if not run_command([HDHOMERUN_CONFIG_PATH, current_ip, "set",
                         f"/tuner{tuner_index}/program", program]):
+        device.release_tuner(tuner_index)
         return None, False
 
     print(f"  Tuner {tuner_index} locked to vchannel {vchannel}.")
@@ -243,27 +345,28 @@ def tune_to_channel(vchannel):
 # =============================================================================
 
 def keep_alive_thread():
-    """
-    Periodically pings the HDHR to keep it active.
+    """Periodically pings the HDHR to keep it active.
+
     On failure, attempts full rediscovery and lineup refresh.
+    Uses ``_shutdown_event.wait()`` so the thread exits promptly on shutdown
+    instead of sleeping through the full interval.
     """
-    global HDHOMERUN_IP, CHANNELS
     consecutive_failures = 0
     print(f"Keep-alive thread started (interval={KEEP_ALIVE_INTERVAL}s).")
 
-    while True:
-        time.sleep(KEEP_ALIVE_INTERVAL)
-
-        current_ip = HDHOMERUN_IP
+    while not _shutdown_event.wait(timeout=KEEP_ALIVE_INTERVAL):
+        current_ip = device.ip
+        if not current_ip:
+            continue
         try:
             # Touch /sys/version AND /tuner0/status to keep the full device engaged
             subprocess.run(
                 [HDHOMERUN_CONFIG_PATH, current_ip, "get", "/sys/version"],
-                check=True, capture_output=True, text=True, timeout=10
+                check=True, capture_output=True, text=True, timeout=10,
             )
             subprocess.run(
                 [HDHOMERUN_CONFIG_PATH, current_ip, "get", "/tuner0/status"],
-                check=True, capture_output=True, text=True, timeout=10
+                check=True, capture_output=True, text=True, timeout=10,
             )
             if consecutive_failures > 0:
                 print(f"Keep-alive: recovered after {consecutive_failures} failure(s).")
@@ -282,94 +385,32 @@ def keep_alive_thread():
 #  HTTP Handler
 # =============================================================================
 
+_CHANNEL_RE = re.compile(r'^/auto/v([\d.]+)$')
+
+
 class ProxyHTTPRequestHandler(BaseHTTPRequestHandler):
 
-    # Suppress per-request log lines from BaseHTTPRequestHandler
+    # Suppress default per-request logging; use our own format
     def log_message(self, format, *args):
         print(f"[HTTP] {self.address_string()} — {format % args}")
 
     def do_GET(self):
         parsed_path = urlparse(self.path)
 
-        # --- Health check endpoint ---
+        # --- Health check ---
         if parsed_path.path == "/health":
-            reachable = device_is_reachable(HDHOMERUN_IP, timeout=5)
-            status_code = 200 if reachable else 503
-            body = json.dumps({
-                "status": "ok" if reachable else "device_unreachable",
-                "device_ip": HDHOMERUN_IP,
-                "tuners": TUNER_COUNT,
-                "channels": len(CHANNELS),
-            })
-            self.send_response(status_code)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(body.encode("utf-8"))
+            self._handle_health()
             return
 
         # --- M3U playlist ---
         if parsed_path.path == "/lineup.m3u":
-            self.send_response(200)
-            self.send_header("Content-Type", "application/x-mpegURL")
-            self.end_headers()
-            host = self.headers["Host"]
-
-            with _state_lock:
-                channels = list(CHANNELS)
-
-            m3u_content = "#EXTM3U\n"
-            for chan in channels:
-                m3u_content += (
-                    f'#EXTINF:-1 tvg-id="{chan["GuideNumber"]}" '
-                    f'tvg-chno="{chan["GuideNumber"]}" '
-                    f'tvg-name="{chan["GuideName"]}",{chan["GuideName"]}\n'
-                    f'http://{host}/auto/v{chan["GuideNumber"]}\n'
-                )
-            self.wfile.write(m3u_content.encode("utf-8"))
+            self._handle_lineup()
             return
 
         # --- Stream a channel ---
-        if parsed_path.path.startswith("/auto/v"):
-            channel = parsed_path.path.split("v")[-1]
-            tuner_index, success = tune_to_channel(channel)
-            if not success:
-                self.send_response(503)
-                self.send_header("Content-Type", "text/plain")
-                self.end_headers()
-                self.wfile.write(b"Failed to tune - device may be unreachable.")
-                return
-
-            self.send_response(200)
-            self.send_header("Content-Type", "video/mpeg")
-            self.end_headers()
-
-            print(f"Streaming tuner {tuner_index} → vchannel {channel}...")
-            process = subprocess.Popen(
-                [HDHOMERUN_CONFIG_PATH, HDHOMERUN_IP, "save", f"/tuner{tuner_index}", "-"],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-            )
-            try:
-                while True:
-                    chunk = process.stdout.read(STREAM_CHUNK_SIZE)
-                    if not chunk:
-                        print(f"Stream ended (tuner {tuner_index}) — no more data.")
-                        break
-                    self.wfile.write(chunk)
-            except (BrokenPipeError, ConnectionResetError):
-                print(f"Client disconnected (tuner {tuner_index}).")
-            except Exception as e:
-                print(f"Stream error (tuner {tuner_index}): {e}")
-            finally:
-                process.terminate()
-                try:
-                    process.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                    process.wait()
-                print(f"Stream stopped (tuner {tuner_index}). Releasing tuner...")
-                run_command([HDHOMERUN_CONFIG_PATH, HDHOMERUN_IP, "set",
-                             f"/tuner{tuner_index}/channel", "none"])
+        match = _CHANNEL_RE.match(parsed_path.path)
+        if match:
+            self._handle_stream(match.group(1))
             return
 
         # --- 404 ---
@@ -377,6 +418,103 @@ class ProxyHTTPRequestHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "text/plain")
         self.end_headers()
         self.wfile.write(b"Not Found.")
+
+    # -- /health --------------------------------------------------------------
+
+    def _handle_health(self):
+        current_ip = device.ip
+        reachable = device_is_reachable(current_ip, timeout=5)
+        body = json.dumps({
+            "status": "ok" if reachable else "device_unreachable",
+            "device_ip": current_ip,
+            "tuners": device.tuner_count,
+            "channels": device.channel_count,
+        }).encode("utf-8")
+        self.send_response(200 if reachable else 503)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    # -- /lineup.m3u ----------------------------------------------------------
+
+    def _handle_lineup(self):
+        host = self.headers.get("Host", "localhost")
+        channels = device.channels
+
+        # Build the body first so we can set Content-Length
+        parts = ["#EXTM3U\n"]
+        for chan in channels:
+            gn = chan["GuideNumber"]
+            name = chan["GuideName"]
+            parts.append(
+                f'#EXTINF:-1 tvg-id="{gn}" '
+                f'tvg-chno="{gn}" '
+                f'tvg-name="{name}",{name}\n'
+                f'http://{host}/auto/v{gn}\n'
+            )
+        body = "".join(parts).encode("utf-8")
+
+        self.send_response(200)
+        self.send_header("Content-Type", "application/x-mpegURL")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    # -- /auto/v<channel> -----------------------------------------------------
+
+    def _handle_stream(self, channel):
+        tuner_index, success = tune_to_channel(channel)
+        if not success:
+            self.send_response(503)
+            self.send_header("Content-Type", "text/plain")
+            self.end_headers()
+            self.wfile.write(b"Failed to tune - device may be unreachable.")
+            return
+
+        self.send_response(200)
+        self.send_header("Content-Type", "video/mpeg")
+        self.send_header("Connection", "close")
+        self.end_headers()
+
+        current_ip = device.ip
+        print(f"Streaming tuner {tuner_index} → vchannel {channel}...")
+        process = subprocess.Popen(
+            [HDHOMERUN_CONFIG_PATH, current_ip, "save",
+             f"/tuner{tuner_index}", "-"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+        try:
+            fd = process.stdout.fileno()
+            while True:
+                ready, _, _ = select.select([fd], [], [], STREAM_READ_TIMEOUT)
+                if not ready:
+                    print(f"Stream timeout (tuner {tuner_index}) — "
+                          f"no data for {STREAM_READ_TIMEOUT}s, releasing.")
+                    break
+                chunk = os.read(fd, STREAM_CHUNK_SIZE)
+                if not chunk:
+                    print(f"Stream ended (tuner {tuner_index}) — no more data.")
+                    break
+                self.wfile.write(chunk)
+        except (BrokenPipeError, ConnectionResetError):
+            print(f"Client disconnected (tuner {tuner_index}).")
+        except Exception as e:
+            print(f"Stream error (tuner {tuner_index}): {e}")
+        finally:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+            if process.stdout:
+                process.stdout.close()
+            print(f"Stream stopped (tuner {tuner_index}). Releasing tuner...")
+            run_command([HDHOMERUN_CONFIG_PATH, current_ip, "set",
+                         f"/tuner{tuner_index}/channel", "none"])
+            device.release_tuner(tuner_index)
 
 
 # =============================================================================
@@ -386,13 +524,21 @@ class ProxyHTTPRequestHandler(BaseHTTPRequestHandler):
 _httpd = None
 
 
-def graceful_shutdown(signum, frame):
+def graceful_shutdown(signum, _frame):
+    """Handle SIGTERM / SIGINT cleanly.
+
+    Sets the shutdown event (so the keep-alive thread exits promptly),
+    releases all tuners, and tells the HTTP server to stop accepting.
+    ``_httpd.shutdown()`` is called on a separate thread because it blocks
+    until ``serve_forever()`` returns — calling it from the signal handler
+    on the main thread would deadlock.
+    """
     sig_name = signal.Signals(signum).name
     print(f"\nReceived {sig_name} — shutting down gracefully...")
+    _shutdown_event.set()
     cleanup_tuners()
     if _httpd:
-        _httpd.shutdown()
-    sys.exit(0)
+        threading.Thread(target=_httpd.shutdown, daemon=True).start()
 
 
 # =============================================================================
@@ -405,20 +551,20 @@ if __name__ == "__main__":
     signal.signal(signal.SIGINT, graceful_shutdown)
 
     # Step 1: Discover the device (unless HDHOMERUN_IP is set via env)
-    if not HDHOMERUN_IP:
-        HDHOMERUN_IP = discover_hdhomerun()
+    if not device.ip:
+        device.ip = discover_hdhomerun()
 
-    if not HDHOMERUN_IP:
+    if not device.ip:
         print("FATAL: Could not discover HDHomeRun device. Exiting.")
         sys.exit(1)
 
     # Step 2: Fetch config and lineup
-    lineup = fetch_device_config_and_lineup(HDHOMERUN_IP)
+    lineup = fetch_device_config_and_lineup(device.ip)
     if not lineup:
         print("FATAL: Could not fetch channel lineup. Exiting.")
         sys.exit(1)
 
-    CHANNELS = lineup
+    device.channels = lineup
 
     # Step 3: Clean up any stale tuner locks from previous runs
     cleanup_tuners()
@@ -428,15 +574,15 @@ if __name__ == "__main__":
     heartbeat.start()
 
     # Step 5: Start the HTTP server
-    server_address = ("0.0.0.0", PROXY_PORT)
-    _httpd = ThreadingHTTPServer(server_address, ProxyHTTPRequestHandler)
+    _httpd = ThreadingHTTPServer(("0.0.0.0", PROXY_PORT), ProxyHTTPRequestHandler)
     print(f"\n{'='*60}")
-    print(f"  HDHomeRun Legacy Proxy v9 (Active Wake & Recovery)")
-    print(f"  Device:     {HDHOMERUN_IP}")
-    print(f"  Tuners:     {TUNER_COUNT}")
-    print(f"  Channels:   {len(CHANNELS)}")
-    print(f"  Listening:  http://0.0.0.0:{PROXY_PORT}")
-    print(f"  Heartbeat:  every {KEEP_ALIVE_INTERVAL}s")
-    print(f"  Endpoints:  /lineup.m3u  /auto/v<channel>  /health")
+    print(f"  HDHomeRun Legacy Proxy v10 (Refactored)")
+    print(f"  Device:      {device.ip}")
+    print(f"  Tuners:      {device.tuner_count}")
+    print(f"  Channels:    {device.channel_count}")
+    print(f"  Modulation:  {MODULATION}")
+    print(f"  Listening:   http://0.0.0.0:{PROXY_PORT}")
+    print(f"  Heartbeat:   every {KEEP_ALIVE_INTERVAL}s")
+    print(f"  Endpoints:   /lineup.m3u  /auto/v<channel>  /health")
     print(f"{'='*60}\n")
     _httpd.serve_forever()
